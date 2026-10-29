@@ -46,6 +46,7 @@
 #include <Eigen/Core>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <pcl_conversions/pcl_conversions.h>
@@ -88,6 +89,9 @@ string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
 
 double res_mean_last = 0.05, total_residual = 0.0;
+// slam_ws: the registration's information for position (world) and rotation (body), from the last
+// iteration's Jacobian, for the health message.
+Eigen::Matrix<double, 6, 6> HtH_pose = Eigen::Matrix<double, 6, 6>::Zero();
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
@@ -631,7 +635,18 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
+    // slam_ws: the body (IMU) velocity and angular rate, in the body frame.
+    const V3D vel_body = state_point.rot.conjugate() * state_point.vel;
+    odomAftMapped.twist.twist.linear.x = vel_body(0);
+    odomAftMapped.twist.twist.linear.y = vel_body(1);
+    odomAftMapped.twist.twist.linear.z = vel_body(2);
+    if (!Measures.imu.empty())
+    {
+        const auto &w = Measures.imu.back()->angular_velocity;
+        odomAftMapped.twist.twist.angular.x = w.x - state_point.bg(0);
+        odomAftMapped.twist.twist.angular.y = w.y - state_point.bg(1);
+        odomAftMapped.twist.twist.angular.z = w.z - state_point.bg(2);
+    }
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -643,6 +658,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    pubOdomAftMapped->publish(odomAftMapped);  // slam_ws: after the covariance, not before
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
@@ -656,6 +672,30 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
     trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
     tf_br->sendTransform(trans);
+}
+
+// slam_ws: one health record per scan, for slam_ws's lio_adapter: [lidar end time (s), processing
+// (s), matched points, downsampled points, mean residual (m), and the information along x, y and
+// yaw of a level frame (gravity from the state): Ixx, Ixy, Ixyaw, Iyy, Iyyaw, Iyawyaw].
+rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr health_pub_;
+void publish_health(double processing_s)
+{
+    if (!health_pub_) return;
+    V3D up = -state_point.grav.get_vect();
+    up.normalize();
+    V3D ex = std::abs(up(0)) < 0.9 ? V3D(1, 0, 0) : V3D(0, 1, 0);
+    V3D x_l = (ex - ex.dot(up) * up).normalized();
+    V3D y_l = up.cross(x_l);
+    const V3D yaw_body = state_point.rot.conjugate() * up;  // a turn about the vertical, in the body
+    Eigen::Matrix<double, 6, 3> T = Eigen::Matrix<double, 6, 3>::Zero();
+    T.block<3, 1>(0, 0) = x_l;
+    T.block<3, 1>(0, 1) = y_l;
+    T.block<3, 1>(3, 2) = yaw_body;
+    const Eigen::Matrix3d J = T.transpose() * HtH_pose * T;
+    std_msgs::msg::Float64MultiArray m;
+    m.data = {lidar_end_time, processing_s, double(effct_feat_num), double(feats_down_size), res_mean_last,
+              J(0, 0), J(0, 1), J(0, 2), J(1, 1), J(1, 2), J(2, 2)};
+    health_pub_->publish(m);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -790,6 +830,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
     }
+    HtH_pose = ekfom_data.h_x.leftCols(6).transpose() * ekfom_data.h_x.leftCols(6) / LASER_POINT_COV;  // slam_ws
     solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -924,7 +965,7 @@ public:
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::QoS(rclcpp::KeepLast(20)).reliable(), standard_pcl_cbk);  // slam_ws: reliable, frames are MBs
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
@@ -932,6 +973,8 @@ public:
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        pubHealth_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("/fast_lio/health", 20);  // slam_ws
+        health_pub_ = pubHealth_;
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -977,6 +1020,7 @@ private:
             t0 = omp_get_wtime();
 
             p_imu->Process(Measures, kf, feats_undistort);
+            const double t_imu = omp_get_wtime();  // slam_ws
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
@@ -990,6 +1034,7 @@ private:
                             false : true;
             /*** Segment the map in lidar FOV ***/
             lasermap_fov_segment();
+            const double t_seg = omp_get_wtime();  // slam_ws
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -1028,6 +1073,9 @@ private:
             feats_down_world->resize(feats_down_size);
 
             V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
+            // slam_ws: no file writes in the loop unless asked for: when the disk stalled (the laptop
+            // waking from sleep, its drive taking the kernel's 30 s timeout) this line held a scan 28 s.
+            if (runtime_pos_log)
             fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
             <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
 
@@ -1062,6 +1110,12 @@ private:
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            publish_health(t_update_end - t0);  // slam_ws
+            if (t_update_end - t0 > 0.5)  // slam_ws: where a slow scan spent its time
+                RCLCPP_WARN(this->get_logger(), "slow scan (%.3f s): IMU and undistortion %.3f, map trim %.3f (%d deleted), "
+                            "downsample %.3f, preparation %.3f, update %.3f s; map %d points, scan %d",
+                            t_update_end - t0, t_imu - t0, t_seg - t_imu, kdtree_delete_counter, t1 - t_seg,
+                            t_update_start - t1, t_update_end - t_update_start, featsFromMapNum, feats_down_size);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1138,6 +1192,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pubHealth_;  // slam_ws
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
